@@ -19,25 +19,69 @@
 
   Jeroen Frijters
   jeroen@frijters.net
-  
+
  */
 package sun.font;
 
 import java.awt.Font;
 import java.awt.font.FontRenderContext;
 import java.awt.geom.AffineTransform;
+import java.lang.ref.Reference;
+import java.lang.ref.SoftReference;
 import java.util.Locale;
+import java.util.concurrent.ConcurrentHashMap;
 
 import sun.awt.SunHints;
 
 
 
 /**
- * 
+ *
  */
 public abstract class Font2D{
 
+    protected int style = Font.PLAIN;
+
+    /*
+     * A mapper can be independent of the strike.
+     * Perhaps the reference to the mapper ought to be held on the
+     * scaler, as it may be implemented via scaler functionality anyway
+     * and so the mapper would be useless if its native portion was
+     * freed when the scaler was GC'd.
+     */
+    protected CharToGlyphMapper mapper;
+
     public Font2DHandle handle = new Font2DHandle(this);
+
+    /*
+     * The strike cache is maintained per "Font2D" as that is the
+     * principal object by which you look up fonts.
+     * It means more Hashmaps, but look ups can be quicker because
+     * the map will have fewer entries, and there's no need to try to
+     * make the Font2D part of the key.
+     */
+    protected ConcurrentHashMap<FontStrikeDesc, Reference>
+        strikeCache = new ConcurrentHashMap<FontStrikeDesc, Reference>();
+
+    /* Store the last Strike in a Reference object.
+     * Similarly to the strike that was stored on a C++ font object,
+     * this is an optimisation which helps if multiple clients (ie
+     * typically SunGraphics2D instances) are using the same font, then
+     * as may be typical of many UIs, they are probably using it in the
+     * same style, so it can be a win to first quickly check if the last
+     * strike obtained from this Font2D satifies the needs of the next
+     * client too.
+     * This pre-supposes that a FontStrike is a shareable object, which
+     * it should.
+     */
+    protected Reference lastFontStrike = new SoftReference(null);
+
+    abstract CharToGlyphMapper getMapper();
+
+    /*
+     * Creates an appropriate strike for the Font2D subclass
+     */
+    abstract FontStrike createStrike(FontStrikeDesc desc);
 
     /* SunGraphics2D has font, tx, aa and fm. From this info
      * can get a Strike object from the cache, creating it if necessary.
@@ -64,10 +108,87 @@ public abstract class Font2D{
         return getStrike(font, new FontRenderContext(devTx, aa == SunHints.INTVAL_TEXT_ANTIALIAS_ON,
                 fm == SunHints.INTVAL_FRACTIONALMETRICS_ON));
     }
-    
+
     public FontStrike getStrike(Font font, FontRenderContext frc) {
         // TODO Auto-generated method stub
         return null;
+    }
+
+    FontStrike getStrike(FontStrikeDesc desc) {
+        return getStrike(desc, true);
+    }
+
+    private FontStrike getStrike(FontStrikeDesc desc, boolean copy) {
+        /* Before looking in the map, see if the descriptor matches the
+         * last strike returned from this Font2D. This should often be a win
+         * since its common for the same font, in the same size to be
+         * used frequently, for example in many parts of a UI.
+         *
+         * If its not the same then we use the descriptor to locate a
+         * Reference to the strike. If it exists and points to a strike,
+         * then we update the last strike to refer to that and return it.
+         *
+         * If the key isn't in the map, or its reference object has been
+         * collected, then we create a new strike, put it in the map and
+         * set it to be the last strike.
+         */
+        FontStrike strike = (FontStrike)lastFontStrike.get();
+        if (strike != null && desc.equals(strike.desc)) {
+            //strike.lastlookupTime = System.currentTimeMillis();
+            return strike;
+        } else {
+            Reference strikeRef = strikeCache.get(desc);
+            if (strikeRef != null) {
+                strike = (FontStrike)strikeRef.get();
+                if (strike != null) {
+                    //strike.lastlookupTime = System.currentTimeMillis();
+                    lastFontStrike = new SoftReference(strike);
+                    StrikeCache.refStrike(strike);
+                    return strike;
+                }
+            }
+            /* When we create a new FontStrike instance, we *must*
+             * ask the StrikeCache for a reference. We must then ensure
+             * this reference remains reachable, by storing it in the
+             * Font2D's strikeCache map.
+             * So long as the Reference is there (reachable) then if the
+             * reference is cleared, it will be enqueued for disposal.
+             * If for some reason we explicitly remove this reference, it
+             * must only be done when holding a strong reference to the
+             * referent (the FontStrike), or if the reference is cleared,
+             * then we must explicitly "dispose" of the native resources.
+             * The only place this currently happens is in this same method,
+             * where we find a cleared reference and need to overwrite it
+             * here with a new reference.
+             * Clearing the whilst holding a strong reference, should only
+             * be done if the
+             */
+            if (copy) {
+                desc = new FontStrikeDesc(desc);
+            }
+            strike = createStrike(desc);
+            //StrikeCache.addStrike();
+            /* If we are creating many strikes on this font which
+             * involve non-quadrant rotations, or more general
+             * transforms which include shears, then force the use
+             * of weak references rather than soft references.
+             * This means that it won't live much beyond the next GC,
+             * which is what we want for what is likely a transient strike.
+             */
+            int txType = desc.glyphTx.getType();
+            if (txType == AffineTransform.TYPE_GENERAL_TRANSFORM ||
+                (txType & AffineTransform.TYPE_GENERAL_ROTATION) != 0 &&
+                strikeCache.size() > 10) {
+                strikeRef = StrikeCache.getStrikeRef(strike, true);
+            } else {
+                strikeRef = StrikeCache.getStrikeRef(strike);
+            }
+            strikeCache.put(desc, strikeRef);
+            //strike.lastlookupTime = System.currentTimeMillis();
+            lastFontStrike = new SoftReference(strike);
+            StrikeCache.refStrike(strike);
+            return strike;
+        }
     }
 
     public void removeFromCache(FontStrikeDesc desc){
@@ -94,8 +215,8 @@ public abstract class Font2D{
         metrics[0] = strikeMetrics.getAscent();
         metrics[1] = strikeMetrics.getDescent();
         metrics[2] = strikeMetrics.getLeading();
-        metrics[3] = strikeMetrics.getMaxAdvance();    
-        
+        metrics[3] = strikeMetrics.getMaxAdvance();
+
         getStyleMetrics(font.getSize2D(), metrics, 4);
     }
 
@@ -117,7 +238,7 @@ public abstract class Font2D{
         metrics[offset+2] = metrics[offset+1] / 1.5f;
         metrics[offset+3] = metrics[offset+1];
     }
-    
+
     /**
      * The length of the metrics array must be >= 4.  This method will
      * store the following elements in that array before returning:
@@ -132,7 +253,7 @@ public abstract class Font2D{
         metrics[0] = strikeMetrics.getAscent();
         metrics[1] = strikeMetrics.getDescent();
         metrics[2] = strikeMetrics.getLeading();
-        metrics[3] = strikeMetrics.getMaxAdvance();    
+        metrics[3] = strikeMetrics.getMaxAdvance();
     }
 
     /*

@@ -19,7 +19,7 @@
 
   Jeroen Frijters
   jeroen@frijters.net
-  
+
  */
 package sun.font;
 
@@ -32,12 +32,17 @@ import ikvm.internal.NotYetImplementedError;
 
 
 /**
- * 
+ *
  */
 public class CompositeFont extends Font2D{
-	
+
 	private final PhysicalFont delegate;
-	
+
+	int numSlots;
+	int numMetricsSlots;
+	int[] exclusionRanges;
+	int[] maxIndices;
+
 
     public CompositeFont(PhysicalFont physicalFont, CompositeFont dialog2d) {
     	delegate = physicalFont;
@@ -50,7 +55,7 @@ public class CompositeFont extends Font2D{
     public int getNumSlots() {
     	throw new NotYetImplementedError();
     }
-    
+
     public PhysicalFont getSlotFont(int slot) {
     	if( slot == 0){
     		return delegate;
@@ -61,7 +66,7 @@ public class CompositeFont extends Font2D{
 	public boolean isStdComposite() {
 		throw new NotYetImplementedError();
 	}
-	
+
 	@Override
     public int getStyle(){
 		return delegate.getStyle();
@@ -72,81 +77,136 @@ public class CompositeFont extends Font2D{
         return delegate.createNetFont(font);
     }
 
-	public FontStrike getStrike(java.awt.Font font, AffineTransform devTx,
+	@Override
+  public FontStrike getStrike(java.awt.Font font, AffineTransform devTx,
 			int aa, int fm) {
 		return delegate.getStrike(font, devTx, aa, fm);
 	}
 
-	public FontStrike getStrike(java.awt.Font font, FontRenderContext frc) {
+	@Override
+  public FontStrike getStrike(java.awt.Font font, FontRenderContext frc) {
 		return delegate.getStrike(font, frc);
 	}
 
-	public void removeFromCache(FontStrikeDesc desc) {
+	@Override
+  public void removeFromCache(FontStrikeDesc desc) {
 		delegate.removeFromCache(desc);
 	}
 
-	public void getFontMetrics(java.awt.Font font, AffineTransform identityTx,
+	@Override
+  public void getFontMetrics(java.awt.Font font, AffineTransform identityTx,
 			Object antiAliasingHint, Object fractionalMetricsHint,
 			float[] metrics) {
 		delegate.getFontMetrics(font, identityTx, antiAliasingHint,
 				fractionalMetricsHint, metrics);
 	}
 
-	public void getStyleMetrics(float pointSize, float[] metrics, int offset) {
+        public boolean isExcludedChar(int slot, int charcode) {
+
+          if (exclusionRanges == null || maxIndices == null ||
+            slot >= numMetricsSlots) {
+	      return false;
+          }
+
+          int minIndex = 0;
+          int maxIndex = maxIndices[slot];
+          if (slot > 0) {
+            minIndex = maxIndices[slot - 1];
+          }
+          int curIndex = minIndex;
+          while (maxIndex > curIndex) {
+            if ((charcode >= exclusionRanges[curIndex])
+              && (charcode <= exclusionRanges[curIndex+1])) {
+                return true;      // excluded
+              }
+              curIndex += 2;
+            }
+            return false;
+	  }
+
+	@Override
+  public void getStyleMetrics(float pointSize, float[] metrics, int offset) {
 		delegate.getStyleMetrics(pointSize, metrics, offset);
 	}
 
-	public void getFontMetrics(java.awt.Font font, FontRenderContext frc,
+	@Override
+  public void getFontMetrics(java.awt.Font font, FontRenderContext frc,
 			float[] metrics) {
 		delegate.getFontMetrics(font, frc, metrics);
 	}
 
-	public boolean useAAForPtSize(int ptsize) {
+	@Override
+  public boolean useAAForPtSize(int ptsize) {
 		return delegate.useAAForPtSize(ptsize);
 	}
 
-	public boolean hasSupplementaryChars() {
+	@Override
+  public CharToGlyphMapper getMapper() {
+	    if (mapper == null) {
+	        mapper = new CompositeGlyphMapper(this);
+	    }
+	    return mapper;
+	}
+
+	@Override
+  public boolean hasSupplementaryChars() {
 		return delegate.hasSupplementaryChars();
 	}
 
-	public String getPostscriptName() {
+	@Override
+  public String getPostscriptName() {
 		return delegate.getPostscriptName();
 	}
 
-	public String getFontName(Locale l) {
+	@Override
+  public String getFontName(Locale l) {
 		return delegate.getFontName(l);
 	}
 
-	public String getFamilyName(Locale l) {
+	@Override
+  public String getFamilyName(Locale l) {
 		return delegate.getFamilyName(l);
 	}
 
-	public int getNumGlyphs() {
+	@Override
+  public int getNumGlyphs() {
 		return delegate.getNumGlyphs();
 	}
 
-	public int charToGlyph(int wchar) {
+	@Override
+  public int charToGlyph(int wchar) {
 		return delegate.charToGlyph(wchar);
 	}
 
-	public int getMissingGlyphCode() {
+	@Override
+  public int getMissingGlyphCode() {
 		return delegate.getMissingGlyphCode();
 	}
 
-	public boolean canDisplay(char c) {
+	@Override
+  public boolean canDisplay(char c) {
 		return delegate.canDisplay(c);
 	}
 
-	public boolean canDisplay(int cp) {
+	@Override
+  public boolean canDisplay(int cp) {
 		return delegate.canDisplay(cp);
 	}
 
-	public byte getBaselineFor(char c) {
+	@Override
+  public byte getBaselineFor(char c) {
 		return delegate.getBaselineFor(c);
 	}
 
-	public float getItalicAngle(java.awt.Font font, AffineTransform at,
+	@Override
+  public float getItalicAngle(java.awt.Font font, AffineTransform at,
 			Object aaHint, Object fmHint) {
 		return delegate.getItalicAngle(font, at, aaHint, fmHint);
 	}
+
+  @Override
+  FontStrike createStrike(FontStrikeDesc desc)
+  {
+    return new CompositeStrike(this, desc);
+  }
 }

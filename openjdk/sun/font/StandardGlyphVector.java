@@ -19,42 +19,55 @@
 
   Jeroen Frijters
   jeroen@frijters.net
-  
+
  */
 package sun.font;
 
-import ikvm.awt.IkvmToolkit;
+import static java.awt.RenderingHints.VALUE_TEXT_ANTIALIAS_GASP;
 
 import java.awt.Font;
+import java.awt.Point;
+import java.awt.Rectangle;
 import java.awt.Shape;
 import java.awt.font.FontRenderContext;
-import java.awt.font.GlyphMetrics;
 import java.awt.font.GlyphJustificationInfo;
+import java.awt.font.GlyphMetrics;
 import java.awt.font.GlyphVector;
 import java.awt.font.LineMetrics;
 import java.awt.geom.AffineTransform;
+import java.awt.geom.GeneralPath;
+import java.awt.geom.PathIterator;
 import java.awt.geom.Point2D;
 import java.awt.geom.Rectangle2D;
+import java.lang.ref.SoftReference;
 import java.text.CharacterIterator;
 
+import ikvm.awt.IkvmToolkit;
 import ikvm.internal.NotYetImplementedError;
 
 /**
  * Standard implementation of GlyphVector used by Font, GlyphList, and SunGraphics2D.
- * 
+ *
  */
 public class StandardGlyphVector extends GlyphVector{
-    private Font font;
-    private FontRenderContext frc;
+    private final Font font;
+    private final FontRenderContext frc;
     private final String glyphs; // always
     private float[] positions; // only if not default advances
+    private int flags; // indicates whether positions, charIndices is interesting
+
+    // transforms information
+    private GlyphTransformInfo gti; // information about per-glyph transforms
+
+    // !!! can we get rid of any of this extra stuff?
+    private AffineTransform ftx;   // font transform without translation
+    private AffineTransform dtx;   // device transform used for strike calculations, no translation
+    private AffineTransform invdtx; // inverse of dtx or null if dtx is identity
+    private final Font2D font2D;
+    private final FontStrike strike;
+    private SoftReference fsref;   // font strike reference for glyphs with no per-glyph transform
 
 
-
-    private Font2D font2D;
-    private FontStrike strike;
-    
-    
     /////////////////////////////
     // Constructors and Factory methods
     /////////////////////////////
@@ -97,7 +110,7 @@ public class StandardGlyphVector extends GlyphVector{
     public StandardGlyphVector( Font font, int[] glyphs, FontRenderContext frc ) {
         this( font, glyphs2chars(glyphs), frc );
     }
-    
+
     /**
      * Symmetric to {@link #getGlyphCodes(int, int, int[])}
      * Currently there is no real mapping possible between the chars and the glyph IDs in the TTF file
@@ -147,7 +160,7 @@ public class StandardGlyphVector extends GlyphVector{
         }
         if (start < 0) {
             throw new IndexOutOfBoundsException("start = " + start);
-        }        
+        }
         if (start > glyphs.length() - count) { // watch out for overflow if index + count overlarge
             throw new IndexOutOfBoundsException("start + count = " + (start + count));
         }
@@ -207,10 +220,26 @@ public class StandardGlyphVector extends GlyphVector{
     @Override
     public Shape getGlyphOutline( int glyphIndex, float x, float y ) {
         initPositions();
-        
+
         return IkvmToolkit.DefaultToolkit.get().outline( font, frc, glyphs.substring( glyphIndex, glyphIndex + 1 ), x + positions[glyphIndex * 2], y );
     }
-    
+
+    private void clearCaches(int ix) {
+        if (lbcacheRef != null) {
+            Shape[] lbcache = (Shape[])lbcacheRef.get();
+            if (lbcache != null) {
+                lbcache[ix] = null;
+            }
+        }
+
+        if (vbcacheRef != null) {
+            Shape[] vbcache = (Shape[])vbcacheRef.get();
+            if (vbcache != null) {
+                vbcache[ix] = null;
+            }
+        }
+    }
+
     @Override
     public Point2D getGlyphPosition(int ix) {
         initPositions();
@@ -265,7 +294,8 @@ public class StandardGlyphVector extends GlyphVector{
         return new Rectangle2D.Float( x, -metrics.getAscent(), positions[(ix + 1) * 2] - x, metrics.getAscent()
                         + metrics.getDescent() + metrics.getLeading() );
     }
-    
+    private SoftReference lbcacheRef;
+
     @Override
     public Shape getGlyphVisualBounds(int ix) {
         if (ix < 0 || ix >= glyphs.length()) {
@@ -275,6 +305,7 @@ public class StandardGlyphVector extends GlyphVector{
         initPositions();
         return IkvmToolkit.DefaultToolkit.get().outline( font, frc, glyphs.substring( ix, ix + 1 ), positions[ix * 2], 0 );
     }
+    private SoftReference vbcacheRef;
 
     @Override
     public GlyphMetrics getGlyphMetrics(int ix) {
@@ -356,7 +387,7 @@ public class StandardGlyphVector extends GlyphVector{
             StandardGlyphVector result = (StandardGlyphVector)super.clone();
 
             if (positions != null) {
-                result.positions = (float[])positions.clone();
+                result.positions = positions.clone();
             }
 
             return result;
@@ -381,7 +412,7 @@ public class StandardGlyphVector extends GlyphVector{
             throw new IllegalArgumentException("srcPositions.length != " + requiredLength);
         }
 
-        positions = (float[])srcPositions.clone();
+        positions = srcPositions.clone();
 
     }
 
@@ -422,8 +453,21 @@ public class StandardGlyphVector extends GlyphVector{
     }
 
     @Override
-    public void setGlyphTransform(int glyphIndex, AffineTransform newTX){
-        throw new NotYetImplementedError();
+    public void setGlyphTransform(int ix, AffineTransform newTX){
+        if (ix < 0 || ix >= glyphs.length()) {
+          throw new IndexOutOfBoundsException("ix = " + ix);
+      }
+
+      if (gti == null) {
+          if (newTX == null || newTX.isIdentity()) {
+              return;
+          }
+          gti = new GlyphTransformInfo(this);
+      }
+      gti.setGlyphTransform(ix, newTX); // sets flags
+      if (gti.transformCount() == 0) {
+          gti = null;
+      }
     }
 
 
@@ -486,12 +530,50 @@ public class StandardGlyphVector extends GlyphVector{
         }
     }
 
+    /**
+     * OR newFlags with existing flags.  First computes existing flags if needed.
+     */
+    private void addFlags(int newflags) {
+        flags = getLayoutFlags() | newflags;
+    }
+
+    /**
+     * AND the complement of clearedFlags with existing flags.  First computes existing flags if needed.
+     */
+    private void clearFlags(int clearedFlags) {
+        flags = getLayoutFlags() & ~clearedFlags;
+    }
+
+    // general utility methods
+
+    // encapsulate the test to check whether we have per-glyph transforms
+    private GlyphStrike getGlyphStrike(int ix) {
+        if (gti == null) {
+            return getDefaultStrike();
+        } else {
+            return gti.getStrike(ix);
+        }
+    }
+
+    // encapsulate access to cached default glyph strike
+    private GlyphStrike getDefaultStrike() {
+        GlyphStrike gs = null;
+        if (fsref != null) {
+            gs = (GlyphStrike)fsref.get();
+        }
+        if (gs == null) {
+            gs = GlyphStrike.create(this, dtx, null);
+            fsref = new SoftReference(gs);
+        }
+        return gs;
+    }
+
     private void addDefaultGlyphAdvance(int glyphID, Point2D.Float result) {
         Point2D.Float adv = strike.getGlyphMetrics(glyphID);
         result.x += adv.x;
         result.y += adv.y;
     }
-    
+
     /**
      * If the text is a simple text and we can use FontDesignMetrics without a stackoverflow.
      * @see FontDesignMetrics#stringWidth(String)
@@ -508,4 +590,499 @@ public class StandardGlyphVector extends GlyphVector{
 		}
 		return true;
 	}
+
+
+	    /////////////////////
+	    // Internal utility classes
+	    /////////////////////
+
+	    // !!! I have this as a separate class instead of just inside SGV,
+	    // but I previously didn't bother.  Now I'm trying this again.
+	    // Probably still not worth it, but I'd like to keep sgv's small in the common case.
+
+	    static final class GlyphTransformInfo {
+	        StandardGlyphVector sgv;  // reference back to glyph vector - yuck
+	        int[] indices;            // index into unique strikes
+	        double[] transforms;      // six doubles per unique transform, because AT is a pain to manipulate
+	        SoftReference strikesRef; // ref to unique strikes, one per transform
+	        boolean haveAllStrikes;   // true if the strike array has been filled by getStrikes().
+
+	        // used when first setting a transform
+	        GlyphTransformInfo(StandardGlyphVector sgv) {
+	            this.sgv = sgv;
+	        }
+
+	        // used when cloning a glyph vector, need to set back link
+	        GlyphTransformInfo(StandardGlyphVector sgv, GlyphTransformInfo rhs) {
+	            this.sgv = sgv;
+
+	            this.indices = rhs.indices == null ? null : (int[])rhs.indices.clone();
+	            this.transforms = rhs.transforms == null ? null : (double[])rhs.transforms.clone();
+	            this.strikesRef = null; // can't share cache, so rather than clone, we just null out
+	        }
+
+	        // used in sgv equality
+	        public boolean equals(GlyphTransformInfo rhs) {
+	            if (rhs == null) {
+	                return false;
+	            }
+	            if (rhs == this) {
+	                return true;
+	            }
+	            if (this.indices.length != rhs.indices.length) {
+	                return false;
+	            }
+	            if (this.transforms.length != rhs.transforms.length) {
+	                return false;
+	            }
+
+	            // slow since we end up processing the same transforms multiple
+	            // times, but since transforms can be in any order, we either do
+	            // this or create a mapping.  Equality tests aren't common so
+	            // leave it like this.
+	            for (int i = 0; i < this.indices.length; ++i) {
+	                int tix = this.indices[i];
+	                int rix = rhs.indices[i];
+	                if ((tix == 0) != (rix == 0)) {
+	                    return false;
+	                }
+	                if (tix != 0) {
+	                    tix *= 6;
+	                    rix *= 6;
+	                    for (int j = 6; j > 0; --j) {
+	                        if (this.indices[--tix] != rhs.indices[--rix]) {
+	                            return false;
+	                        }
+	                    }
+	                }
+	            }
+	            return true;
+	        }
+
+	        // implements sgv.setGlyphTransform
+	        void setGlyphTransform(int glyphIndex, AffineTransform newTX) {
+
+	            // we store all the glyph transforms as a double array, and for each glyph there
+	            // is an entry in the txIndices array indicating which transform to use.  0 means
+	            // there's no transform, 1 means use the first transform (the 6 doubles at offset
+	            // 0), 2 means use the second transform (the 6 doubles at offset 6), etc.
+	            //
+	            // Since this can be called multiple times, and since the number of transforms
+	            // affects the time it takes to construct the glyphs, we try to keep the arrays as
+	            // compact as possible, by removing transforms that are no longer used, and reusing
+	            // transforms where we already have them.
+
+	            double[] temp = new double[6];
+	            boolean isIdentity = true;
+	            if (newTX == null || newTX.isIdentity()) {
+	                // Fill in temp
+	                temp[0] = temp[3] = 1.0;
+	            }
+	            else {
+	                isIdentity = false;
+	                newTX.getMatrix(temp);
+	            }
+
+	            if (indices == null) {
+	                if (isIdentity) { // no change
+	                    return;
+	                }
+
+	                indices = new int[sgv.glyphs.length()];
+	                indices[glyphIndex] = 1;
+	                transforms = temp;
+	            } else {
+	                boolean addSlot = false; // assume we're not growing
+	                int newIndex = -1;
+	                if (isIdentity) {
+	                    newIndex = 0; // might shrink
+	                } else {
+	                    addSlot = true; // assume no match
+	                    int i;
+	                loop:
+	                    for (i = 0; i < transforms.length; i += 6) {
+	                        for (int j = 0; j < 6; ++j) {
+	                            if (transforms[i + j] != temp[j]) {
+	                                continue loop;
+	                            }
+	                        }
+	                        addSlot = false;
+	                        break;
+	                    }
+	                    newIndex = i / 6 + 1; // if no match, end of list
+	                }
+
+	                // if we're using the same transform, nothing to do
+	                int oldIndex = indices[glyphIndex];
+	                if (newIndex != oldIndex) {
+	                    // see if we are removing last use of the old slot
+	                    boolean removeSlot = false;
+	                    if (oldIndex != 0) {
+	                        removeSlot = true;
+	                        for (int i = 0; i < indices.length; ++i) {
+	                            if (indices[i] == oldIndex && i != glyphIndex) {
+	                                removeSlot = false;
+	                                break;
+	                            }
+	                        }
+	                    }
+
+	                    if (removeSlot && addSlot) { // reuse old slot with new transform
+	                        newIndex = oldIndex;
+	                        System.arraycopy(temp, 0, transforms, (newIndex - 1) * 6, 6);
+	                    } else if (removeSlot) {
+	                        if (transforms.length == 6) { // removing last one, so clear arrays
+	                            indices = null;
+	                            transforms = null;
+
+	                            sgv.clearCaches(glyphIndex);
+	                            sgv.clearFlags(FLAG_HAS_TRANSFORMS);
+	                            strikesRef = null;
+
+	                            return;
+	                        }
+
+	                        double[] ttemp = new double[transforms.length - 6];
+	                        System.arraycopy(transforms, 0, ttemp, 0, (oldIndex - 1) * 6);
+	                        System.arraycopy(transforms, oldIndex * 6, ttemp, (oldIndex - 1) * 6,
+	                                         transforms.length - oldIndex * 6);
+	                        transforms = ttemp;
+
+	                        // clean up indices
+	                        for (int i = 0; i < indices.length; ++i) {
+	                            if (indices[i] > oldIndex) { // ignore == oldIndex, it's going away
+	                                indices[i] -= 1;
+	                            }
+	                        }
+	                        if (newIndex > oldIndex) { // don't forget to decrement this too if we need to
+	                            --newIndex;
+	                        }
+	                    } else if (addSlot) {
+	                        double[] ttemp = new double[transforms.length + 6];
+	                        System.arraycopy(transforms, 0, ttemp, 0, transforms.length);
+	                        System.arraycopy(temp, 0, ttemp, transforms.length, 6);
+	                        transforms = ttemp;
+	                    }
+
+	                    indices[glyphIndex] = newIndex;
+	                }
+	            }
+
+	            sgv.clearCaches(glyphIndex);
+	            sgv.addFlags(FLAG_HAS_TRANSFORMS);
+	            strikesRef = null;
+	        }
+
+	        // implements sgv.getGlyphTransform
+	        AffineTransform getGlyphTransform(int ix) {
+	            int index = indices[ix];
+	            if (index == 0) {
+	                return null;
+	            }
+
+	            int x = (index - 1) * 6;
+	            return new AffineTransform(transforms[x + 0],
+	                                       transforms[x + 1],
+	                                       transforms[x + 2],
+	                                       transforms[x + 3],
+	                                       transforms[x + 4],
+	                                       transforms[x + 5]);
+	        }
+
+	        int transformCount() {
+	            if (transforms == null) {
+	                return 0;
+	            }
+	            return transforms.length / 6;
+	        }
+
+	        /**
+	         * The strike cache works like this.
+	         *
+	         * -Each glyph is thought of as having a transform, usually identity.
+	         * -Each request for a strike is based on a device transform, either the
+	         * one in the frc or the rendering transform.
+	         * -For general info, strikes are held with soft references.
+	         * -When rendering, strikes must be held with hard references for the
+	         * duration of the rendering call.  GlyphList will have to hold this
+	         * info along with the image and position info, but toss the strike info
+	         * when done.
+	         * -Build the strike cache as needed.  If the dev transform we want to use
+	         * has changed from the last time it is built, the cache is flushed by
+	         * the caller before these methods are called.
+	         *
+	         * Use a tx that doesn't include translation components of dst tx.
+	         */
+	        Object setupGlyphImages(long[] images, float[] positions, AffineTransform tx) {
+	            int len = sgv.glyphs.length();
+
+	            GlyphStrike[] sl = getAllStrikes();
+	            for (int i = 0; i < len; ++i) {
+	                GlyphStrike gs = sl[indices[i]];
+	                int glyphID = sgv.glyphs.charAt(i);
+	                images[i] = gs.strike.getGlyphImagePtr(glyphID);
+
+	                gs.getGlyphPosition(glyphID, i*2, sgv.positions, positions);
+	            }
+	            tx.transform(positions, 0, positions, 0, len);
+
+	            return sl;
+	        }
+
+	        Rectangle getGlyphsPixelBounds(AffineTransform tx, float x, float y, int start, int count) {
+	            Rectangle result = null;
+	            Rectangle r = new Rectangle();
+	            Point2D.Float pt = new Point.Float();
+	            int n = start * 2;
+	            while (--count >= 0) {
+	                GlyphStrike gs = getStrike(start);
+	                pt.x = x + sgv.positions[n++] + gs.dx;
+	                pt.y = y + sgv.positions[n++] + gs.dy;
+	                tx.transform(pt, pt);
+	                gs.strike.getGlyphImageBounds(sgv.glyphs.charAt(start++), pt, r);
+	                if (!r.isEmpty()) {
+	                    if (result == null) {
+	                        result = new Rectangle(r);
+	                    } else {
+	                        result.add(r);
+	                    }
+	                }
+	            }
+	            return result != null ? result : r;
+	        }
+
+	        GlyphStrike getStrike(int glyphIndex) {
+	            if (indices != null) {
+	                GlyphStrike[] strikes = getStrikeArray();
+	                return getStrikeAtIndex(strikes, indices[glyphIndex]);
+	            }
+	            return sgv.getDefaultStrike();
+	        }
+
+	        private GlyphStrike[] getAllStrikes() {
+	            if (indices == null) {
+	                return null;
+	            }
+
+	            GlyphStrike[] strikes = getStrikeArray();
+	            if (!haveAllStrikes) {
+	                for (int i = 0; i < strikes.length; ++i) {
+	                    getStrikeAtIndex(strikes, i);
+	                }
+	                haveAllStrikes = true;
+	            }
+
+	            return strikes;
+	        }
+
+	        private GlyphStrike[] getStrikeArray() {
+	            GlyphStrike[] strikes = null;
+	            if (strikesRef != null) {
+	                strikes = (GlyphStrike[])strikesRef.get();
+	            }
+	            if (strikes == null) {
+	                haveAllStrikes = false;
+	                strikes = new GlyphStrike[transformCount() + 1];
+	                strikesRef = new SoftReference(strikes);
+	            }
+
+	            return strikes;
+	        }
+
+	        private GlyphStrike getStrikeAtIndex(GlyphStrike[] strikes, int strikeIndex) {
+	            GlyphStrike strike = strikes[strikeIndex];
+	            if (strike == null) {
+	                if (strikeIndex == 0) {
+	                    strike = sgv.getDefaultStrike();
+	                } else {
+	                    int ix = (strikeIndex - 1) * 6;
+	                    AffineTransform gtx = new AffineTransform(transforms[ix],
+	                                                              transforms[ix+1],
+	                                                              transforms[ix+2],
+	                                                              transforms[ix+3],
+	                                                              transforms[ix+4],
+	                                                              transforms[ix+5]);
+
+	                    strike = GlyphStrike.create(sgv, sgv.dtx, gtx);
+	                }
+	                strikes[strikeIndex] = strike;
+	            }
+	            return strike;
+	        }
+	    }
+
+	    // This adjusts the metrics by the translation components of the glyph
+	    // transform.  It is done here since the translation is not known by the
+	    // strike.
+	    // It adjusts the position of the image and the advance.
+
+	    public static final class GlyphStrike {
+	        StandardGlyphVector sgv;
+	        FontStrike strike; // hard reference
+	        float dx;
+	        float dy;
+
+	        static GlyphStrike create(StandardGlyphVector sgv, AffineTransform dtx, AffineTransform gtx) {
+	            float dx = 0;
+	            float dy = 0;
+
+	            AffineTransform tx = sgv.ftx;
+	            if (!dtx.isIdentity() || gtx != null) {
+	                tx = new AffineTransform(sgv.ftx);
+	                if (gtx != null) {
+	                    tx.preConcatenate(gtx);
+	                    dx = (float)tx.getTranslateX(); // uses ftx then gtx to get translation
+	                    dy = (float)tx.getTranslateY();
+	                }
+	                if (!dtx.isIdentity()) {
+	                    tx.preConcatenate(dtx);
+	                }
+	            }
+
+	            int ptSize = 1; // only matters for 'gasp' case.
+	            Object aaHint = sgv.frc.getAntiAliasingHint();
+	            if (aaHint == VALUE_TEXT_ANTIALIAS_GASP) {
+	                /* Must pass in the calculated point size for rendering.
+	                 * If the glyph tx is anything other than identity or a
+	                 *  simple translate, calculate the transformed point size.
+	                 */
+	                if (!tx.isIdentity() &&
+	                    (tx.getType() & ~AffineTransform.TYPE_TRANSLATION) != 0) {
+	                    double shearx = tx.getShearX();
+	                    if (shearx != 0) {
+	                        double scaley = tx.getScaleY();
+	                        ptSize =
+	                            (int)Math.sqrt(shearx * shearx + scaley * scaley);
+	                    } else {
+	                        ptSize = (int)(Math.abs(tx.getScaleY()));
+	                    }
+	                }
+	            }
+	            int aa = FontStrikeDesc.getAAHintIntVal(aaHint,sgv.font2D, ptSize);
+	            int fm = FontStrikeDesc.getFMHintIntVal
+	                (sgv.frc.getFractionalMetricsHint());
+	            FontStrikeDesc desc = new FontStrikeDesc(dtx,
+	                                                     tx,
+	                                                     sgv.font.getStyle(),
+	                                                     aa, fm);
+	            // Get the strike via the handle. Shouldn't matter
+	            // if we've invalidated the font but its an extra precaution.
+	            FontStrike strike = sgv.font2D.handle.font2D.getStrike(desc);  // !!! getStrike(desc, false)
+
+	            return new GlyphStrike(sgv, strike, dx, dy);
+	        }
+
+	        private GlyphStrike(StandardGlyphVector sgv, FontStrike strike, float dx, float dy) {
+	            this.sgv = sgv;
+	            this.strike = strike;
+	            this.dx = dx;
+	            this.dy = dy;
+	        }
+
+	        void getADL(ADL result) {
+	            StrikeMetrics sm = strike.getFontMetrics();
+	            Point2D.Float delta = null;
+	            if (sgv.font.isTransformed()) {
+	                delta = new Point2D.Float();
+	                delta.x = (float)sgv.font.getTransform().getTranslateX();
+	                delta.y = (float)sgv.font.getTransform().getTranslateY();
+	            }
+
+	            result.ascentX = -sm.ascentX;
+	            result.ascentY = -sm.ascentY;
+	            result.descentX = sm.descentX;
+	            result.descentY = sm.descentY;
+	            result.leadingX = sm.leadingX;
+	            result.leadingY = sm.leadingY;
+	        }
+
+	        void getGlyphPosition(int glyphID, int ix, float[] positions, float[] result) {
+	            result[ix] = positions[ix] + dx;
+	            ++ix;
+	            result[ix] = positions[ix] + dy;
+	        }
+
+	        void addDefaultGlyphAdvance(int glyphID, Point2D.Float result) {
+	            // !!! change this API?  Creates unnecessary garbage.  Also the name doesn't quite fit.
+	            // strike.addGlyphAdvance(Point2D.Float adv);  // hey, whaddya know, matches my api :-)
+	            Point2D.Float adv = strike.getGlyphMetrics(glyphID);
+	            result.x += adv.x + dx;
+	            result.y += adv.y + dy;
+	        }
+
+	        Rectangle2D getGlyphOutlineBounds(int glyphID, float x, float y) {
+	            Rectangle2D result = null;
+	            if (sgv.invdtx == null) {
+	                result = new Rectangle2D.Float();
+	                result.setRect(strike.getGlyphOutlineBounds(glyphID)); // don't mutate cached rect
+	            } else {
+	                GeneralPath gp = strike.getGlyphOutline(glyphID, 0, 0);
+	                gp.transform(sgv.invdtx);
+	                result = gp.getBounds2D();
+	            }
+	            /* Since x is the logical advance of the glyph to this point.
+	             * Because of the way that Rectangle.union is specified, this
+	             * means that subsequent unioning of a rect including that
+	             * will be affected, even if the glyph is empty. So skip such
+	             * cases. This alone isn't a complete solution since x==0
+	             * may also not be what is wanted. The code that does the
+	             * unioning also needs to be aware to ignore empty glyphs.
+	             */
+	            if (!result.isEmpty()) {
+	                result.setRect(result.getMinX() + x + dx,
+	                               result.getMinY() + y + dy,
+	                               result.getWidth(), result.getHeight());
+	            }
+	            return result;
+	        }
+
+	        void appendGlyphOutline(int glyphID, GeneralPath result, float x, float y) {
+	            // !!! fontStrike needs a method for this.  For that matter, GeneralPath does.
+	            GeneralPath gp = null;
+	            if (sgv.invdtx == null) {
+	                gp = strike.getGlyphOutline(glyphID, x + dx, y + dy);
+	            } else {
+	                gp = strike.getGlyphOutline(glyphID, 0, 0);
+	                gp.transform(sgv.invdtx);
+	                gp.transform(AffineTransform.getTranslateInstance(x + dx, y + dy));
+	            }
+	            PathIterator iterator = gp.getPathIterator(null);
+	            result.append(iterator, false);
+	        }
+	    }
+
+	    static class ADL {
+	        public float ascentX;
+	        public float ascentY;
+	        public float descentX;
+	        public float descentY;
+	        public float leadingX;
+	        public float leadingY;
+
+	        @Override
+          public String toString() {
+	            return toStringBuffer(null).toString();
+	        }
+
+	        protected StringBuffer toStringBuffer(StringBuffer result) {
+	            if (result == null) {
+	                result = new StringBuffer();
+	            }
+	            result.append("ax: ");
+	            result.append(ascentX);
+	            result.append(" ay: ");
+	            result.append(ascentY);
+	            result.append(" dx: ");
+	            result.append(descentX);
+	            result.append(" dy: ");
+	            result.append(descentY);
+	            result.append(" lx: ");
+	            result.append(leadingX);
+	            result.append(" ly: ");
+	            result.append(leadingY);
+
+	            return result;
+	        }
+	    }
+
 }

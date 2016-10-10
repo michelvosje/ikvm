@@ -19,7 +19,7 @@
 
   Jeroen Frijters
   jeroen@frijters.net
-  
+
  */
 package sun.font;
 
@@ -39,8 +39,10 @@ import cli.System.Globalization.CultureInfo;
  */
 class PhysicalFont extends Font2D{
 
+    private final CompositeFont compositeFont;
+
     private final FontFamily family;
-    
+
     private String familyName; // family name for logical fonts
 
     private final FontStyle style;
@@ -72,20 +74,24 @@ class PhysicalFont extends Font2D{
     private float strikethroughThickness;
     private float underlinePosition;
     private float underlineThickness;
-    
-    
+
+
     PhysicalFont(String name, int style){
         this.family = createFontFamily(name);
         this.style = createFontStyle(family, style);
+
+        this.compositeFont = new CompositeFont(this);
     }
 
     PhysicalFont(FontFamily family, int style){
         this.family = family;
         this.style = createFontStyle(family, style);
+
+        this.compositeFont = new CompositeFont(this);
     }
 
 
-    
+
     /**
      * {@inheritDoc}
      */
@@ -127,10 +133,10 @@ class PhysicalFont extends Font2D{
         try{
             if(false) throw new cli.System.ArgumentException();
             return new FontFamily(name);
-        }catch(cli.System.ArgumentException ex){ 
+        }catch(cli.System.ArgumentException ex){
         	// continue
         }
-        
+
         //now we want map specific Name to a shorter Family Name like "Arial Bold" --> "Arial"
         String shortName = name;
         int spaceIdx = shortName.lastIndexOf(' ');
@@ -139,12 +145,12 @@ class PhysicalFont extends Font2D{
             try{
                 if(false) throw new cli.System.ArgumentException();
                 return new FontFamily(shortName);
-            }catch(cli.System.ArgumentException ex){ 
+            }catch(cli.System.ArgumentException ex){
             	// continue
             }
         	spaceIdx = shortName.lastIndexOf(' ');
         }
-        
+
         //now we want map generic names to specific families like "courier" --> "Courier New"
         FontFamily[] fontFanilies = FontFamily.get_Families();
         name = name.toLowerCase();
@@ -154,7 +160,7 @@ class PhysicalFont extends Font2D{
 				return fontFamily;
 			}
 		}
-        
+
         //we have not find a valid font, we use the default font
         familyName = Font.DIALOG;
         return FontFamily.get_GenericSansSerif();
@@ -233,7 +239,7 @@ class PhysicalFont extends Font2D{
     	}
         return family.GetName(getLanguage(locale));
     }
-    
+
     /**
      * Convert the Java locale to a language ID
      */
@@ -248,8 +254,8 @@ class PhysicalFont extends Font2D{
         }
         return language;
     }
-    
-    
+
+
     /**
      * {@inheritDoc}
      */
@@ -284,10 +290,10 @@ class PhysicalFont extends Font2D{
                         underlineThickness = ((Number)getUnderlineThickness.invoke(familyTypeface)).floatValue();
                     }
                 }
-                metrics[offset++] = -strikethroughPosition * pointSize;  
-                metrics[offset++] = strikethroughThickness * pointSize;  
-                metrics[offset++] = -underlinePosition * pointSize;  
-                metrics[offset] = underlineThickness * pointSize;  
+                metrics[offset++] = -strikethroughPosition * pointSize;
+                metrics[offset++] = strikethroughThickness * pointSize;
+                metrics[offset++] = -underlinePosition * pointSize;
+                metrics[offset] = underlineThickness * pointSize;
             }catch(Throwable ex){
                 // ignore it, NET 3.0 is not available, use the default implementation
                 super.getStyleMetrics(pointSize, metrics, offset);
@@ -295,5 +301,18 @@ class PhysicalFont extends Font2D{
         }finally{
             isMediaLoaded = true;
         }
+    }
+
+    @Override
+    FontStrike createStrike(FontStrikeDesc desc)
+    {
+      return compositeFont.createStrike(desc);
+    }
+
+    @Override
+    CharToGlyphMapper getMapper()
+    {
+      // TODO Auto-generated method stub
+      return null;
     }
 }

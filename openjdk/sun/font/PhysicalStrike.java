@@ -47,7 +47,7 @@ import cli.System.Drawing.Text.TextRenderingHint;
 import ikvm.internal.NotYetImplementedError;
 
 /**
- * A FontStrike implementation that based on .NET fonts. 
+ * A FontStrike implementation that based on .NET fonts.
  * It replace the equals naming Sun class
  */
 public class PhysicalStrike extends FontStrike{
@@ -62,9 +62,9 @@ public class PhysicalStrike extends FontStrike{
     private final FontRenderContext frc;
     private final float size2D;
     private final float factor;
-    
+
     private StrikeMetrics strike;
-    
+
     public PhysicalStrike(Font font, FontFamily family, FontStyle style, FontRenderContext frc){
         this.font = font;
         this.family = family;
@@ -73,7 +73,7 @@ public class PhysicalStrike extends FontStrike{
         this.size2D = font.getNetFont().get_Size();
         this.factor = size2D / family.GetEmHeight(style);
     }
-    
+
     /**
      * {@inheritDoc}
      */
@@ -82,10 +82,14 @@ public class PhysicalStrike extends FontStrike{
         return new Float(getCodePointAdvance(ch), 0);
     }
 
+    int getSlot0GlyphImagePtrs(int[] glyphCodes, long[] images, int  len) {
+        return 0;
+    }
+
 
     /**
      * Create a Graphics with the settings for fractional or fixed FontRenderContext
-     * 
+     *
      * @return
      */
     private static Graphics createGraphics(boolean fractional){
@@ -130,10 +134,10 @@ public class PhysicalStrike extends FontStrike{
             float height = family.GetLineSpacing(style) * factor;
             float leading = height - ascent - descent;
             strike = new StrikeMetrics(
-                    0, -ascent - leading/2, 
-                    0, descent - leading/2, 
-                    0.25f, 0, 
-                    0, leading, 
+                    0, -ascent - leading/2,
+                    0, descent - leading/2,
+                    0.25f, 0,
+                    0, leading,
                     size2D * 2, 0);
         }
         return strike;
